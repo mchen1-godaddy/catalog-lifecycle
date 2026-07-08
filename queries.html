@@ -140,13 +140,13 @@ ORDER BY 1, 2;</pre>
 </div>
 
 <div class="query-block" id="no-txn">
-  <h2>% of 30-Day Catalog Adopters with No Catalog Transactions in 90 Days</h2>
+  <h2>30-Day Catalog Adopters: % with No Catalog Txn vs No Any Txn in 90 Days</h2>
   <div class="meta">
     <span>📊 Chart 3</span>
     <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
-    <span>36 rows</span>
+    <span>72 rows (long format — 4 series)</span>
   </div>
-  <div class="note">Prepend the shared temp table SQL above before running. Identifies merchants who set up a catalog within 30 days of KYC but never made a catalog transaction in the 90-day post-KYC window.</div>
+  <div class="note">Prepend the shared temp table SQL above before running. Solid lines = no catalog transactions in 90 days. Dashed lines = no transactions of any kind in 90 days. The gap between the two lines per channel reveals merchants who ARE transacting via other channels but not through catalog.</div>
   <pre>WITH merchant_kyc AS (
     SELECT
         business_uuid,
@@ -161,7 +161,6 @@ ORDER BY 1, 2;</pre>
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
--- Merchants who added at least one catalog product within 30 days of KYC
 adopters_30d AS (
     SELECT DISTINCT m.business_uuid, m.current_acquisition_channel, m.kyc_month,
         m.kyc_ts, m.kyc_date
@@ -171,29 +170,48 @@ adopters_30d AS (
         AND c.created_at_utc_ts >= m.kyc_ts
         AND c.created_at_utc_ts <= DATEADD(day, 30, m.kyc_date)
 ),
--- Of those, who made at least one catalog transaction within 90 days
-txn_90d AS (
+catalog_txn_90d AS (
     SELECT DISTINCT a.business_uuid, a.kyc_month, a.current_acquisition_channel
     FROM adopters_30d a
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = a.business_uuid
     WHERE t.catalog_item_flag = 1
       AND t.create_utc_ts >= a.kyc_ts
       AND t.create_utc_ts <= DATEADD(day, 90, a.kyc_date)
+),
+any_txn_90d AS (
+    SELECT DISTINCT a.business_uuid, a.kyc_month, a.current_acquisition_channel
+    FROM adopters_30d a
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = a.business_uuid
+    WHERE t.create_utc_ts >= a.kyc_ts
+      AND t.create_utc_ts <= DATEADD(day, 90, a.kyc_date)
+),
+base AS (
+    SELECT
+        a.kyc_month,
+        a.current_acquisition_channel,
+        COUNT(DISTINCT a.business_uuid)          AS adopters_30d,
+        COUNT(DISTINCT ct.business_uuid)         AS with_catalog_txn_90d,
+        COUNT(DISTINCT at.business_uuid)         AS with_any_txn_90d
+    FROM adopters_30d a
+    LEFT JOIN catalog_txn_90d ct
+        ON a.business_uuid = ct.business_uuid
+       AND a.kyc_month = ct.kyc_month
+       AND a.current_acquisition_channel = ct.current_acquisition_channel
+    LEFT JOIN any_txn_90d at
+        ON a.business_uuid = at.business_uuid
+       AND a.kyc_month = at.kyc_month
+       AND a.current_acquisition_channel = at.current_acquisition_channel
+    GROUP BY 1, 2
 )
-SELECT
-    a.kyc_month,
-    a.current_acquisition_channel,
-    COUNT(DISTINCT a.business_uuid)                                                    AS adopters_30d,
-    COUNT(DISTINCT t.business_uuid)                                                    AS with_catalog_txn_90d,
-    COUNT(DISTINCT a.business_uuid) - COUNT(DISTINCT t.business_uuid)                 AS no_catalog_txn_90d,
-    ROUND(100.0 * (COUNT(DISTINCT a.business_uuid) - COUNT(DISTINCT t.business_uuid))
-          / NULLIF(COUNT(DISTINCT a.business_uuid), 0), 2)                             AS pct_no_catalog_txn_90d
-FROM adopters_30d a
-LEFT JOIN txn_90d t
-    ON a.business_uuid = t.business_uuid
-   AND a.kyc_month = t.kyc_month
-   AND a.current_acquisition_channel = t.current_acquisition_channel
-GROUP BY 1, 2
+SELECT kyc_month,
+    current_acquisition_channel || ' — No Catalog Txn' AS series,
+    ROUND(100.0 * (adopters_30d - with_catalog_txn_90d) / NULLIF(adopters_30d, 0), 2) AS pct
+FROM base
+UNION ALL
+SELECT kyc_month,
+    current_acquisition_channel || ' — No Any Txn' AS series,
+    ROUND(100.0 * (adopters_30d - with_any_txn_90d) / NULLIF(adopters_30d, 0), 2) AS pct
+FROM base
 ORDER BY 1, 2;</pre>
 </div>
 
