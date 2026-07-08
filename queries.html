@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KYC Catalog Lifecycle — SQL Queries</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: #f5f6fa; color: #222; }
+  header { background: #1f3c6e; color: white; padding: 20px 40px; }
+  header h1 { margin: 0 0 4px; font-size: 1.6rem; }
+  header p { margin: 0; opacity: 0.8; font-size: 0.9rem; }
+  nav { background: #fff; border-bottom: 1px solid #ddd; padding: 10px 40px; display: flex; gap: 12px; }
+  nav a { text-decoration: none; color: #1f3c6e; font-size: 0.85rem; padding: 4px 10px; border-radius: 12px; border: 1px solid #c0cfe0; }
+  nav a:hover { background: #e8f0fb; }
+  nav a.active { background: #1f3c6e; color: white; border-color: #1f3c6e; }
+  main { max-width: 1100px; margin: 0 auto; padding: 28px 40px 60px; }
+  .query-block { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 28px; padding: 24px 28px; }
+  .query-block h2 { margin: 0 0 6px; font-size: 1.05rem; color: #1f3c6e; }
+  .query-block .meta { font-size: 0.82rem; color: #666; margin-bottom: 14px; }
+  .query-block .meta span { margin-right: 16px; }
+  pre { background: #1e1e2e; color: #cdd6f4; border-radius: 6px; padding: 18px 20px; font-size: 0.82rem; line-height: 1.6; overflow-x: auto; margin: 0; }
+  .note { background: #fffbe6; border-left: 3px solid #f0c040; padding: 10px 14px; border-radius: 4px; font-size: 0.83rem; color: #555; margin-bottom: 14px; }
+  footer { text-align: center; padding: 20px; color: #888; font-size: 0.8rem; }
+  footer a { color: #1f3c6e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KYC Catalog Lifecycle — SQL Reference</h1>
+  <p>All queries powering the dashboard &bull; Redshift / dna_approved / dev.ba_commerce &bull; Data range: Jan 2025 – Jun 2026</p>
+</header>
+<nav>
+  <a href="index.html">← Dashboard</a>
+  <a href="#shared-ctes">Shared CTEs</a>
+  <a href="#adoption">Adoption</a>
+  <a href="#no-txn">No-Txn Rate</a>
+  <a href="#product-mix">Product Mix</a>
+  <a href="#txn-rate">Txn Rate</a>
+  <a href="#retention">Retention</a>
+  <a href="#dropoff">Drop-Off</a>
+</nav>
+<main>
+
+<div class="query-block" id="shared-ctes">
+  <h2>Shared Temp Tables (prepend to segment queries)</h2>
+  <div class="meta">
+    <span>⚠️ Must run in the same session as the query that uses them</span>
+    <span>Used by: Adoption, Product Mix, Txn Rate queries</span>
+  </div>
+  <div class="note">These temp tables deduplicate catalog SKUs to the latest event per (sku_id, store_id) and build a store → business UUID mapping via the latest snapshot.</div>
+  <pre>-- Latest catalog SKU snapshot per store
+DROP TABLE IF EXISTS catalog_sku_job_cln;
+CREATE TEMP TABLE catalog_sku_job_cln AS
+SELECT a.*
+FROM dev.signals_platform_cln.catalog_sku_job_cln a
+INNER JOIN (
+    SELECT sku_id, store_id, MAX(event_utc_ts) AS max_ts
+    FROM dev.signals_platform_cln.catalog_sku_job_cln
+    WHERE created_at_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2
+) b ON a.sku_id = b.sku_id
+    AND a.store_id = b.store_id
+    AND a.event_utc_ts = b.max_ts
+WHERE a.created_at_utc_ts >= '2025-01-01';
+
+-- Store UUID → Business UUID mapping (latest snapshot, US only)
+DROP TABLE IF EXISTS store_business_map;
+CREATE TEMP TABLE store_business_map AS
+SELECT s.store_uuid, b.business_uuid
+FROM poynt_cln.business_cln b
+JOIN poynt_cln.store_cln s
+    ON b.business_id = s.business_id AND s.region = b.region
+WHERE b.snap_date = (SELECT MAX(snap_date) FROM poynt_cln.business_cln WHERE region = 'US')
+  AND s.snap_date = (SELECT MAX(snap_date) FROM poynt_cln.store_cln WHERE region = 'US');</pre>
+</div>
+
+<div class="query-block" id="adoption">
+  <h2>30-Day and 90-Day Catalog Product Adoption % by KYC Month</h2>
+  <div class="meta">
+    <span>📊 Charts 1 &amp; 2</span>
+    <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp)</span>
+    <span>36 rows</span>
+  </div>
+  <div class="note">Prepend the shared temp table SQL above before running. Adoption = at least one catalog <strong>product added</strong> (SKU created) within the window, not a transaction.</div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts            AS kyc_ts,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+adopters_30d AS (
+    SELECT DISTINCT m.business_uuid, m.current_acquisition_channel, m.kyc_month
+    FROM merchant_kyc m
+    JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+    JOIN catalog_sku_job_cln c  ON sbm.store_uuid = c.store_id
+        AND c.created_at_utc_ts >= m.kyc_ts
+        AND c.created_at_utc_ts <= DATEADD(day, 30, m.kyc_date)
+),
+adopters_90d AS (
+    SELECT DISTINCT m.business_uuid, m.current_acquisition_channel, m.kyc_month
+    FROM merchant_kyc m
+    JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+    JOIN catalog_sku_job_cln c  ON sbm.store_uuid = c.store_id
+        AND c.created_at_utc_ts >= m.kyc_ts
+        AND c.created_at_utc_ts <= DATEADD(day, 90, m.kyc_date)
+),
+cohort AS (
+    SELECT current_acquisition_channel, kyc_month,
+        COUNT(DISTINCT business_uuid) AS total_kyc_merchants
+    FROM merchant_kyc
+    GROUP BY 1, 2
+)
+SELECT
+    c.kyc_month,
+    c.current_acquisition_channel,
+    c.total_kyc_merchants,
+    COUNT(DISTINCT a30.business_uuid)                                       AS catalog_adopters_30d,
+    ROUND(100.0 * COUNT(DISTINCT a30.business_uuid)
+          / NULLIF(c.total_kyc_merchants, 0), 2)                            AS catalog_adoption_30d_pct,
+    COUNT(DISTINCT a90.business_uuid)                                       AS catalog_adopters_90d,
+    ROUND(100.0 * COUNT(DISTINCT a90.business_uuid)
+          / NULLIF(c.total_kyc_merchants, 0), 2)                            AS catalog_adoption_90d_pct
+FROM cohort c
+LEFT JOIN adopters_30d a30
+    ON c.kyc_month = a30.kyc_month
+   AND c.current_acquisition_channel = a30.current_acquisition_channel
+LEFT JOIN adopters_90d a90
+    ON c.kyc_month = a90.kyc_month
+   AND c.current_acquisition_channel = a90.current_acquisition_channel
+GROUP BY 1, 2, 3
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block" id="no-txn">
+  <h2>% of 30-Day Catalog Adopters with No Catalog Transactions in 90 Days</h2>
+  <div class="meta">
+    <span>📊 Chart 3</span>
+    <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
+    <span>36 rows</span>
+  </div>
+  <div class="note">Prepend the shared temp table SQL above before running. Identifies merchants who set up a catalog within 30 days of KYC but never made a catalog transaction in the 90-day post-KYC window.</div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts            AS kyc_ts,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+-- Merchants who added at least one catalog product within 30 days of KYC
+adopters_30d AS (
+    SELECT DISTINCT m.business_uuid, m.current_acquisition_channel, m.kyc_month,
+        m.kyc_ts, m.kyc_date
+    FROM merchant_kyc m
+    JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+    JOIN catalog_sku_job_cln c  ON sbm.store_uuid = c.store_id
+        AND c.created_at_utc_ts >= m.kyc_ts
+        AND c.created_at_utc_ts <= DATEADD(day, 30, m.kyc_date)
+),
+-- Of those, who made at least one catalog transaction within 90 days
+txn_90d AS (
+    SELECT DISTINCT a.business_uuid, a.kyc_month, a.current_acquisition_channel
+    FROM adopters_30d a
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = a.business_uuid
+    WHERE t.catalog_item_flag = 1
+      AND t.create_utc_ts >= a.kyc_ts
+      AND t.create_utc_ts <= DATEADD(day, 90, a.kyc_date)
+)
+SELECT
+    a.kyc_month,
+    a.current_acquisition_channel,
+    COUNT(DISTINCT a.business_uuid)                                                    AS adopters_30d,
+    COUNT(DISTINCT t.business_uuid)                                                    AS with_catalog_txn_90d,
+    COUNT(DISTINCT a.business_uuid) - COUNT(DISTINCT t.business_uuid)                 AS no_catalog_txn_90d,
+    ROUND(100.0 * (COUNT(DISTINCT a.business_uuid) - COUNT(DISTINCT t.business_uuid))
+          / NULLIF(COUNT(DISTINCT a.business_uuid), 0), 2)                             AS pct_no_catalog_txn_90d
+FROM adopters_30d a
+LEFT JOIN txn_90d t
+    ON a.business_uuid = t.business_uuid
+   AND a.kyc_month = t.kyc_month
+   AND a.current_acquisition_channel = t.current_acquisition_channel
+GROUP BY 1, 2
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block" id="product-mix">
+  <h2>30-Day Product Count Mix by Segment — Sales Initiated</h2>
+  <div class="meta">
+    <span>📊 Chart 3</span>
+    <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp)</span>
+    <span>90 rows</span>
+  </div>
+  <div class="note">Prepend the shared temp table SQL above before running.</div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        full_application_approval_utc_ts,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel = 'Sales Initiated'   -- change to 'Self Serve' for Chart 4
+),
+products AS (
+    SELECT m.business_uuid, COUNT(DISTINCT c.sku_id) AS n
+    FROM merchant_kyc m
+    JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+    JOIN catalog_sku_job_cln c  ON sbm.store_uuid = c.store_id
+        AND c.created_at_utc_ts >= m.full_application_approval_utc_ts
+        AND c.created_at_utc_ts <= DATEADD(day, 30, m.kyc_date)
+    GROUP BY 1
+),
+seg AS (
+    SELECT
+        m.kyc_month,
+        m.business_uuid,
+        CASE
+            WHEN p.n >= 50 THEN '50+'
+            WHEN p.n >= 25 THEN '25+'
+            WHEN p.n >= 10 THEN '10+'
+            WHEN p.n >= 5  THEN '5+'
+            ELSE '1+'
+        END AS product_segment
+    FROM merchant_kyc m
+    JOIN products p ON m.business_uuid = p.business_uuid
+    WHERE p.n >= 1
+)
+SELECT
+    kyc_month,
+    product_segment,
+    COUNT(DISTINCT business_uuid)                                          AS merchant_count,
+    ROUND(100.0 * COUNT(DISTINCT business_uuid)
+          / NULLIF(SUM(COUNT(DISTINCT business_uuid)) OVER (PARTITION BY kyc_month), 0), 2) AS pct_of_channel
+FROM seg
+GROUP BY 1, 2
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block" id="txn-rate">
+  <h2>30-Day Catalog Txn Rate by Product Segment — Sales Initiated</h2>
+  <div class="meta">
+    <span>📊 Chart 5</span>
+    <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
+    <span>90 rows</span>
+  </div>
+  <div class="note">Prepend the shared temp table SQL above before running. For SS (Chart 6): change channel filter. For 90-day (Charts 7–8): change all DATEADD windows to 90.</div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        full_application_approval_utc_ts,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel = 'Sales Initiated'   -- change to 'Self Serve' for SS
+),
+products AS (
+    SELECT m.business_uuid, COUNT(DISTINCT c.sku_id) AS n
+    FROM merchant_kyc m
+    JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+    JOIN catalog_sku_job_cln c  ON sbm.store_uuid = c.store_id
+        AND c.created_at_utc_ts >= m.full_application_approval_utc_ts
+        AND c.created_at_utc_ts <= DATEADD(day, 30, m.kyc_date)  -- 30 or 90
+    GROUP BY 1
+),
+seg AS (
+    SELECT
+        m.kyc_month,
+        m.business_uuid,
+        m.full_application_approval_utc_ts,
+        CASE
+            WHEN p.n >= 50 THEN '50+'
+            WHEN p.n >= 25 THEN '25+'
+            WHEN p.n >= 10 THEN '10+'
+            WHEN p.n >= 5  THEN '5+'
+            ELSE '1+'
+        END AS product_segment
+    FROM merchant_kyc m
+    JOIN products p ON m.business_uuid = p.business_uuid
+    WHERE p.n >= 1
+),
+txn AS (
+    SELECT DISTINCT t.business_uuid
+    FROM dev.ba_commerce.txn_w_catalog t
+    JOIN seg s ON t.business_uuid = s.business_uuid
+    WHERE t.catalog_item_flag = 1
+      AND t.create_utc_ts >= s.full_application_approval_utc_ts
+      AND t.create_utc_ts <= DATEADD(day, 30, s.full_application_approval_utc_ts::date)  -- 30 or 90
+)
+SELECT
+    s.kyc_month,
+    s.product_segment,
+    COUNT(DISTINCT s.business_uuid)                                        AS segment_merchants,
+    COUNT(DISTINCT t.business_uuid)                                        AS catalog_txn_merchants,
+    ROUND(100.0 * COUNT(DISTINCT t.business_uuid)
+          / NULLIF(COUNT(DISTINCT s.business_uuid), 0), 2)                 AS catalog_txn_pct
+FROM seg s
+LEFT JOIN txn t ON s.business_uuid = t.business_uuid
+GROUP BY 1, 2
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block" id="retention">
+  <h2>Catalog Transaction Retention Curve</h2>
+  <div class="meta">
+    <span>📊 Chart 11</span>
+    <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
+    <span>38 rows</span>
+  </div>
+  <div class="note">Denominator = merchants who ever had at least one catalog transaction post-KYC. Retention at month N = % of that cohort still active in month N.</div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+txn AS (
+    SELECT
+        m.business_uuid,
+        m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month,
+                 DATE_TRUNC('month', t.create_utc_ts)) AS months_since_kyc
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.catalog_item_flag = 1
+      AND t.create_utc_ts >= m.kyc_date
+      AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, 3
+),
+cohort AS (
+    SELECT current_acquisition_channel,
+        COUNT(DISTINCT business_uuid) AS total
+    FROM txn
+    GROUP BY 1
+),
+ret AS (
+    SELECT current_acquisition_channel, months_since_kyc,
+        COUNT(DISTINCT business_uuid) AS active
+    FROM txn
+    WHERE months_since_kyc >= 0
+    GROUP BY 1, 2
+)
+SELECT
+    r.current_acquisition_channel,
+    r.months_since_kyc,
+    ROUND(100.0 * r.active / NULLIF(c.total, 0), 2) AS retention_pct
+FROM ret r
+JOIN cohort c ON r.current_acquisition_channel = c.current_acquisition_channel
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block">
+  <h2>All-Txn vs Catalog-Txn Retention Comparison (4 Series)</h2>
+  <div class="meta">
+    <span>📊 Chart 12</span>
+    <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
+    <span>76 rows</span>
+  </div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+-- Catalog-transaction retention
+cat_txn AS (
+    SELECT m.business_uuid, m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', t.create_utc_ts)) AS months_since_kyc,
+        'Catalog Txn' AS txn_type
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, 3, 4
+),
+-- All-transaction retention
+all_txn AS (
+    SELECT m.business_uuid, m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', t.create_utc_ts)) AS months_since_kyc,
+        'All Txn' AS txn_type
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, 3, 4
+),
+combined AS (SELECT * FROM cat_txn UNION ALL SELECT * FROM all_txn),
+cohort AS (
+    SELECT txn_type, current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total
+    FROM combined GROUP BY 1, 2
+),
+ret AS (
+    SELECT txn_type, current_acquisition_channel, months_since_kyc,
+        COUNT(DISTINCT business_uuid) AS active
+    FROM combined WHERE months_since_kyc >= 0 GROUP BY 1, 2, 3
+)
+SELECT
+    r.current_acquisition_channel || ' — ' || r.txn_type AS series,
+    r.months_since_kyc,
+    ROUND(100.0 * r.active / NULLIF(c.total, 0), 2) AS retention_pct
+FROM ret r
+JOIN cohort c ON r.txn_type = c.txn_type
+    AND r.current_acquisition_channel = c.current_acquisition_channel
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block" id="dropoff">
+  <h2>Catalog Drop-Off Distribution (Last Active Month)</h2>
+  <div class="meta">
+    <span>📊 Chart 9</span>
+    <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
+    <span>38 rows</span>
+  </div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+last_active AS (
+    SELECT
+        m.business_uuid,
+        m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month,
+                 DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.catalog_item_flag = 1
+      AND t.create_utc_ts >= m.kyc_date
+      AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, m.kyc_month
+),
+cohort AS (
+    SELECT current_acquisition_channel,
+        COUNT(DISTINCT business_uuid) AS total
+    FROM last_active GROUP BY 1
+)
+SELECT
+    la.current_acquisition_channel,
+    la.last_active_month,
+    COUNT(DISTINCT la.business_uuid)                                       AS merchant_count,
+    ROUND(100.0 * COUNT(DISTINCT la.business_uuid)
+          / NULLIF(c.total, 0), 2)                                         AS pct_of_channel
+FROM last_active la
+JOIN cohort c ON la.current_acquisition_channel = c.current_acquisition_channel
+WHERE la.last_active_month >= 0
+GROUP BY 1, 2
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block">
+  <h2>All-Txn vs Catalog-Txn Drop-Off Comparison (4 Series)</h2>
+  <div class="meta">
+    <span>📊 Chart 10</span>
+    <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
+    <span>76 rows</span>
+  </div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+catalog_last AS (
+    SELECT m.business_uuid, m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, m.kyc_month
+),
+all_last AS (
+    SELECT m.business_uuid, m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, m.kyc_month
+),
+catalog_cohort AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM catalog_last GROUP BY 1),
+all_cohort    AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM all_last    GROUP BY 1),
+catalog_dist  AS (SELECT current_acquisition_channel, last_active_month, COUNT(DISTINCT business_uuid) AS cnt FROM catalog_last WHERE last_active_month >= 0 GROUP BY 1, 2),
+all_dist      AS (SELECT current_acquisition_channel, last_active_month, COUNT(DISTINCT business_uuid) AS cnt FROM all_last    WHERE last_active_month >= 0 GROUP BY 1, 2)
+SELECT 'Catalog Txn' AS txn_type, d.current_acquisition_channel, d.last_active_month,
+    ROUND(100.0 * d.cnt / NULLIF(c.total, 0), 2) AS pct_of_cohort
+FROM catalog_dist d JOIN catalog_cohort c ON d.current_acquisition_channel = c.current_acquisition_channel
+UNION ALL
+SELECT 'All Txn' AS txn_type, d.current_acquisition_channel, d.last_active_month,
+    ROUND(100.0 * d.cnt / NULLIF(c.total, 0), 2) AS pct_of_cohort
+FROM all_dist d JOIN all_cohort c ON d.current_acquisition_channel = c.current_acquisition_channel
+ORDER BY 1, 2, 3;</pre>
+</div>
+
+</main>
+<footer>GoDaddy Commerce Analytics &bull; KYC Catalog Lifecycle &bull;
+  <a href="https://github.com/mchen1-godaddy/catalog-lifecycle">GitHub</a> &bull;
+  <a href="index.html">← Back to Dashboard</a>
+</footer>
+</body>
+</html>
