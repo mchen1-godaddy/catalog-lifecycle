@@ -141,13 +141,13 @@ ORDER BY 1, 2;</pre>
 </div>
 
 <div class="query-block" id="no-txn">
-  <h2>30-Day Catalog Adopters: % with No Catalog Txn vs No Any Txn in 90 Days</h2>
+  <h2>30-Day Catalog Adopters: % with Catalog Txn vs Any Txn in 90 Days</h2>
   <div class="meta">
     <span>📊 Chart 3</span>
     <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
     <span>72 rows (long format — 4 series)</span>
   </div>
-  <div class="note">Prepend the shared temp table SQL above before running. Solid lines = no catalog transactions in 90 days. Dashed lines = no transactions of any kind in 90 days. The gap between the two lines per channel reveals merchants who ARE transacting via other channels but not through catalog.</div>
+  <div class="note">Prepend the shared temp table SQL above before running. Solid lines = % who made a catalog transaction within 90 days. Dashed lines = % who made any transaction (any channel) within 90 days. The gap between the two lines per channel reveals merchants who ARE transacting via other channels but not through catalog.</div>
   <pre>WITH merchant_kyc AS (
     SELECT
         business_uuid,
@@ -205,13 +205,13 @@ base AS (
     GROUP BY 1, 2
 )
 SELECT kyc_month,
-    current_acquisition_channel || ' — No Catalog Txn' AS series,
-    ROUND(100.0 * (adopters_30d - with_catalog_txn_90d) / NULLIF(adopters_30d, 0), 2) AS pct
+    current_acquisition_channel || ' — Catalog Txn' AS series,
+    ROUND(100.0 * with_catalog_txn_90d / NULLIF(adopters_30d, 0), 2) AS pct
 FROM base
 UNION ALL
 SELECT kyc_month,
-    current_acquisition_channel || ' — No Any Txn' AS series,
-    ROUND(100.0 * (adopters_30d - with_any_txn_90d) / NULLIF(adopters_30d, 0), 2) AS pct
+    current_acquisition_channel || ' — Any Txn' AS series,
+    ROUND(100.0 * with_any_txn_90d / NULLIF(adopters_30d, 0), 2) AS pct
 FROM base
 ORDER BY 1, 2;</pre>
 </div>
