@@ -9,7 +9,7 @@
   header { background: #1f3c6e; color: white; padding: 20px 40px; }
   header h1 { margin: 0 0 4px; font-size: 1.6rem; }
   header p { margin: 0; opacity: 0.8; font-size: 0.9rem; }
-  nav { background: #fff; border-bottom: 1px solid #ddd; padding: 10px 40px; display: flex; gap: 12px; }
+  nav { background: #fff; border-bottom: 1px solid #ddd; padding: 10px 40px; display: flex; gap: 12px; flex-wrap: wrap; }
   nav a { text-decoration: none; color: #1f3c6e; font-size: 0.85rem; padding: 4px 10px; border-radius: 12px; border: 1px solid #c0cfe0; }
   nav a:hover { background: #e8f0fb; }
   nav a.active { background: #1f3c6e; color: white; border-color: #1f3c6e; }
@@ -36,8 +36,9 @@
   <a href="#no-txn">No-Txn Rate</a>
   <a href="#product-mix">Product Mix</a>
   <a href="#txn-rate">Txn Rate</a>
-  <a href="#retention">Retention</a>
+  <a href="#agpv-usage">aGPV Usage</a>
   <a href="#dropoff">Drop-Off</a>
+  <a href="#retention">Retention</a>
 </nav>
 <main>
 
@@ -216,13 +217,13 @@ ORDER BY 1, 2;</pre>
 </div>
 
 <div class="query-block" id="product-mix">
-  <h2>30-Day Product Count Mix by Segment — Sales Initiated</h2>
+  <h2>30-Day Product Count Mix by Segment — Sales Initiated / Self Serve</h2>
   <div class="meta">
-    <span>📊 Chart 3</span>
+    <span>📊 Charts 4 &amp; 5</span>
     <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp)</span>
-    <span>90 rows</span>
+    <span>90 rows each</span>
   </div>
-  <div class="note">Prepend the shared temp table SQL above before running.</div>
+  <div class="note">Prepend the shared temp table SQL above before running. Run once per channel by changing the filter below (Chart 4 = Sales Initiated, Chart 5 = Self Serve).</div>
   <pre>WITH merchant_kyc AS (
     SELECT
         business_uuid,
@@ -234,7 +235,7 @@ ORDER BY 1, 2;</pre>
       AND type_desc_text != 'TEST_MERCHANT'
       AND full_application_approval_utc_ts >= '2025-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
-      AND current_acquisition_channel = 'Sales Initiated'   -- change to 'Self Serve' for Chart 4
+      AND current_acquisition_channel = 'Sales Initiated'   -- change to 'Self Serve' for Chart 5
 ),
 products AS (
     SELECT m.business_uuid, COUNT(DISTINCT c.sku_id) AS n
@@ -272,13 +273,13 @@ ORDER BY 1, 2;</pre>
 </div>
 
 <div class="query-block" id="txn-rate">
-  <h2>30-Day Catalog Txn Rate by Product Segment — Sales Initiated</h2>
+  <h2>30-Day and 90-Day Catalog Txn Rate by Product Segment — Sales Initiated / Self Serve</h2>
   <div class="meta">
-    <span>📊 Chart 5</span>
+    <span>📊 Charts 6–9</span>
     <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
-    <span>90 rows</span>
+    <span>90 rows each</span>
   </div>
-  <div class="note">Prepend the shared temp table SQL above before running. For SS (Chart 6): change channel filter. For 90-day (Charts 7–8): change all DATEADD windows to 90.</div>
+  <div class="note">Prepend the shared temp table SQL above before running. Chart 6 = SI/30-day, Chart 7 = SS/30-day, Chart 8 = SI/90-day, Chart 9 = SS/90-day — toggle the channel filter and the two DATEADD windows (30 or 90) together.</div>
   <pre>WITH merchant_kyc AS (
     SELECT
         business_uuid,
@@ -338,14 +339,74 @@ GROUP BY 1, 2
 ORDER BY 1, 2;</pre>
 </div>
 
-<div class="query-block" id="retention">
-  <h2>Catalog Transaction Retention Curve</h2>
+<div class="query-block" id="agpv-usage">
+  <h2>SI: 30-Day and 90-Day Catalog Usage % by Signed aGPV Band</h2>
   <div class="meta">
-    <span>📊 Chart 11</span>
+    <span>📊 Charts 10 &amp; 11</span>
+    <span>Tables: dna_approved.payment_360, ba_commerce.final_campaign_table, dev.ba_commerce.txn_w_catalog</span>
+    <span>126 rows (30d) / 105 rows (90d)</span>
+  </div>
+  <div class="note">Signed aGPV comes from the sales opportunity record (<code>gd_sales_estimate_agpv_usd_amt</code>), joined on <code>gd_merchant_id = business_uuid</code>. "Usage" here = had at least one catalog transaction within the window, not just a product add. For Chart 11 (90-day), change the window to 90 and restrict <code>full_application_approval_utc_ts &lt; '2026-04-01'</code> so every cohort has a complete 90-day observation period.</div>
+  <pre>WITH merchant_kyc AS (
+    SELECT business_uuid,
+        full_application_approval_utc_ts::date AS kyc_date,
+        TO_CHAR(DATE_TRUNC('month', full_application_approval_utc_ts), 'YYYY-MM') AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'   -- use '2026-04-01' for 90-day chart
+      AND current_acquisition_channel = 'Sales Initiated'
+),
+campaigns AS (
+    SELECT gd_merchant_id,
+        MAX(gd_sales_estimate_agpv_usd_amt) AS signed_agpv
+    FROM ba_commerce.final_campaign_table
+    WHERE gd_merchant_id IS NOT NULL
+    GROUP BY 1
+),
+merchant_agpv AS (
+    SELECT m.business_uuid, m.kyc_date, m.kyc_month,
+        CASE
+            WHEN c.signed_agpv < 50000                                THEN '1. Under $50K'
+            WHEN c.signed_agpv >= 50000  AND c.signed_agpv < 100000  THEN '2. $50K–$100K'
+            WHEN c.signed_agpv >= 100000 AND c.signed_agpv < 250000  THEN '3. $100K–$250K'
+            WHEN c.signed_agpv >= 250000 AND c.signed_agpv < 500000  THEN '4. $250K–$500K'
+            WHEN c.signed_agpv >= 500000 AND c.signed_agpv < 1000000 THEN '5. $500K–$1M'
+            WHEN c.signed_agpv >= 1000000                            THEN '6. Over $1M'
+            ELSE 'Unknown'
+        END AS signed_agpv_band
+    FROM merchant_kyc m
+    LEFT JOIN campaigns c ON m.business_uuid = c.gd_merchant_id
+),
+catalog_txn AS (
+    SELECT t.business_uuid,
+        MIN(t.create_utc_ts::date) AS first_catalog_txn_date
+    FROM dev.ba_commerce.txn_w_catalog t
+    WHERE t.catalog_item_flag = 1
+      AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1
+)
+SELECT
+    m.signed_agpv_band,
+    m.kyc_month,
+    COUNT(DISTINCT m.business_uuid) AS total_merchants,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN ct.first_catalog_txn_date <= m.kyc_date + 30   -- or +90
+                                      THEN m.business_uuid END)
+          / NULLIF(COUNT(DISTINCT m.business_uuid), 0), 2) AS catalog_pct_30d   -- or catalog_pct_90d
+FROM merchant_agpv m
+LEFT JOIN catalog_txn ct ON m.business_uuid = ct.business_uuid
+GROUP BY 1, 2
+ORDER BY 1, 2;</pre>
+</div>
+
+<div class="query-block" id="dropoff">
+  <h2>Catalog Drop-Off Distribution (Last Active Month)</h2>
+  <div class="meta">
+    <span>📊 Chart 12</span>
     <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
     <span>38 rows</span>
   </div>
-  <div class="note">Denominator = merchants who ever had at least one catalog transaction post-KYC. Retention at month N = % of that cohort still active in month N.</div>
   <pre>WITH merchant_kyc AS (
     SELECT
         business_uuid,
@@ -359,45 +420,91 @@ ORDER BY 1, 2;</pre>
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
-txn AS (
+last_active AS (
     SELECT
         m.business_uuid,
         m.current_acquisition_channel,
         DATEDIFF('month', m.kyc_month,
-                 DATE_TRUNC('month', t.create_utc_ts)) AS months_since_kyc
+                 DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
     FROM merchant_kyc m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
     WHERE t.catalog_item_flag = 1
       AND t.create_utc_ts >= m.kyc_date
       AND t.create_utc_ts >= '2025-01-01'
-    GROUP BY 1, 2, 3
+    GROUP BY 1, 2, m.kyc_month
 ),
 cohort AS (
     SELECT current_acquisition_channel,
         COUNT(DISTINCT business_uuid) AS total
-    FROM txn
-    GROUP BY 1
-),
-ret AS (
-    SELECT current_acquisition_channel, months_since_kyc,
-        COUNT(DISTINCT business_uuid) AS active
-    FROM txn
-    WHERE months_since_kyc >= 0
-    GROUP BY 1, 2
+    FROM last_active GROUP BY 1
 )
 SELECT
-    r.current_acquisition_channel,
-    r.months_since_kyc,
-    ROUND(100.0 * r.active / NULLIF(c.total, 0), 2) AS retention_pct
-FROM ret r
-JOIN cohort c ON r.current_acquisition_channel = c.current_acquisition_channel
+    la.current_acquisition_channel,
+    la.last_active_month,
+    COUNT(DISTINCT la.business_uuid)                                       AS merchant_count,
+    ROUND(100.0 * COUNT(DISTINCT la.business_uuid)
+          / NULLIF(c.total, 0), 2)                                         AS pct_of_channel
+FROM last_active la
+JOIN cohort c ON la.current_acquisition_channel = c.current_acquisition_channel
+WHERE la.last_active_month >= 0
+GROUP BY 1, 2
 ORDER BY 1, 2;</pre>
 </div>
 
 <div class="query-block">
+  <h2>All-Txn vs Catalog-Txn Drop-Off Comparison (4 Series)</h2>
+  <div class="meta">
+    <span>📊 Chart 13</span>
+    <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
+    <span>76 rows</span>
+  </div>
+  <pre>WITH merchant_kyc AS (
+    SELECT
+        business_uuid,
+        current_acquisition_channel,
+        full_application_approval_utc_ts::date      AS kyc_date,
+        DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL
+      AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+),
+catalog_last AS (
+    SELECT m.business_uuid, m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, m.kyc_month
+),
+all_last AS (
+    SELECT m.business_uuid, m.current_acquisition_channel,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+    FROM merchant_kyc m
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
+    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    GROUP BY 1, 2, m.kyc_month
+),
+catalog_cohort AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM catalog_last GROUP BY 1),
+all_cohort    AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM all_last    GROUP BY 1),
+catalog_dist  AS (SELECT current_acquisition_channel, last_active_month, COUNT(DISTINCT business_uuid) AS cnt FROM catalog_last WHERE last_active_month >= 0 GROUP BY 1, 2),
+all_dist      AS (SELECT current_acquisition_channel, last_active_month, COUNT(DISTINCT business_uuid) AS cnt FROM all_last    WHERE last_active_month >= 0 GROUP BY 1, 2)
+SELECT 'Catalog Txn' AS txn_type, d.current_acquisition_channel, d.last_active_month,
+    ROUND(100.0 * d.cnt / NULLIF(c.total, 0), 2) AS pct_of_cohort
+FROM catalog_dist d JOIN catalog_cohort c ON d.current_acquisition_channel = c.current_acquisition_channel
+UNION ALL
+SELECT 'All Txn' AS txn_type, d.current_acquisition_channel, d.last_active_month,
+    ROUND(100.0 * d.cnt / NULLIF(c.total, 0), 2) AS pct_of_cohort
+FROM all_dist d JOIN all_cohort c ON d.current_acquisition_channel = c.current_acquisition_channel
+ORDER BY 1, 2, 3;</pre>
+</div>
+
+<div class="query-block" id="retention">
   <h2>All-Txn vs Catalog-Txn Retention Comparison (4 Series)</h2>
   <div class="meta">
-    <span>📊 Chart 12</span>
+    <span>📊 Chart 14</span>
     <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
     <span>76 rows</span>
   </div>
@@ -454,105 +561,114 @@ JOIN cohort c ON r.txn_type = c.txn_type
 ORDER BY 1, 2;</pre>
 </div>
 
-<div class="query-block" id="dropoff">
-  <h2>Catalog Drop-Off Distribution (Last Active Month)</h2>
+<div class="query-block">
+  <h2>SI — Catalog Retention by Cohort Month</h2>
   <div class="meta">
-    <span>📊 Chart 9</span>
+    <span>📊 Chart 15</span>
     <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
-    <span>38 rows</span>
+    <span>90 rows</span>
   </div>
+  <div class="note">Denominator per cohort month = merchants from that KYC month who ever had a catalog transaction post-KYC. Restricted to Jul 2025–Jun 2026 (last 12 months) so the chart stays readable — widen the date filter for the full history. Each cohort month becomes one line at <code>x = months_since_kyc</code>.</div>
   <pre>WITH merchant_kyc AS (
-    SELECT
-        business_uuid,
-        current_acquisition_channel,
-        full_application_approval_utc_ts::date      AS kyc_date,
+    SELECT business_uuid,
+        full_application_approval_utc_ts::date AS kyc_date,
         DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
     FROM dna_approved.payment_360
-    WHERE full_application_approval_utc_ts IS NOT NULL
-      AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
-      AND full_application_approval_utc_ts < '2026-07-01'
-      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+    WHERE full_application_approval_utc_ts IS NOT NULL AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-07-01' AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel = 'Sales Initiated'
 ),
-last_active AS (
-    SELECT
-        m.business_uuid,
-        m.current_acquisition_channel,
-        DATEDIFF('month', m.kyc_month,
-                 DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+txn AS (
+    SELECT m.business_uuid, m.kyc_month,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', t.create_utc_ts)) AS months_since_kyc
     FROM merchant_kyc m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
     WHERE t.catalog_item_flag = 1
       AND t.create_utc_ts >= m.kyc_date
-      AND t.create_utc_ts >= '2025-01-01'
-    GROUP BY 1, 2, m.kyc_month
+      AND t.create_utc_ts >= '2025-07-01'
+    GROUP BY 1, 2, 3
 ),
 cohort AS (
-    SELECT current_acquisition_channel,
-        COUNT(DISTINCT business_uuid) AS total
-    FROM last_active GROUP BY 1
+    SELECT kyc_month, COUNT(DISTINCT business_uuid) AS total
+    FROM txn GROUP BY 1
+),
+ret AS (
+    SELECT kyc_month, months_since_kyc, COUNT(DISTINCT business_uuid) AS active
+    FROM txn WHERE months_since_kyc >= 0 GROUP BY 1, 2
 )
 SELECT
-    la.current_acquisition_channel,
-    la.last_active_month,
-    COUNT(DISTINCT la.business_uuid)                                       AS merchant_count,
-    ROUND(100.0 * COUNT(DISTINCT la.business_uuid)
-          / NULLIF(c.total, 0), 2)                                         AS pct_of_channel
-FROM last_active la
-JOIN cohort c ON la.current_acquisition_channel = c.current_acquisition_channel
-WHERE la.last_active_month >= 0
-GROUP BY 1, 2
+    TO_CHAR(r.kyc_month, 'YYYY-MM') AS kyc_month,
+    r.months_since_kyc,
+    c.total AS cohort_size,
+    ROUND(100.0 * r.active / NULLIF(c.total, 0), 2) AS retention_pct
+FROM ret r
+JOIN cohort c ON r.kyc_month = c.kyc_month
 ORDER BY 1, 2;</pre>
 </div>
 
 <div class="query-block">
-  <h2>All-Txn vs Catalog-Txn Drop-Off Comparison (4 Series)</h2>
+  <h2>SI — Catalog Retention by Cohort Month &amp; Signed aGPV Band</h2>
   <div class="meta">
-    <span>📊 Chart 10</span>
-    <span>Tables: dna_approved.payment_360, dev.ba_commerce.txn_w_catalog</span>
-    <span>76 rows</span>
+    <span>📊 Chart 16</span>
+    <span>Tables: dna_approved.payment_360, ba_commerce.final_campaign_table, dev.ba_commerce.txn_w_catalog</span>
+    <span>600 rows</span>
   </div>
+  <div class="note">Same cohort-retention logic as Chart 15, but the "ever active" cohort and retention denominator are also split by signed aGPV band. The dashboard renders this as a dropdown that filters to one band at a time (one line per cohort month within the selected band).</div>
   <pre>WITH merchant_kyc AS (
-    SELECT
-        business_uuid,
-        current_acquisition_channel,
-        full_application_approval_utc_ts::date      AS kyc_date,
+    SELECT business_uuid,
+        full_application_approval_utc_ts::date AS kyc_date,
         DATE_TRUNC('month', full_application_approval_utc_ts) AS kyc_month
     FROM dna_approved.payment_360
-    WHERE full_application_approval_utc_ts IS NOT NULL
-      AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
-      AND full_application_approval_utc_ts < '2026-07-01'
-      AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
+    WHERE full_application_approval_utc_ts IS NOT NULL AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-07-01' AND full_application_approval_utc_ts < '2026-07-01'
+      AND current_acquisition_channel = 'Sales Initiated'
 ),
-catalog_last AS (
-    SELECT m.business_uuid, m.current_acquisition_channel,
-        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
+campaigns AS (
+    SELECT gd_merchant_id, MAX(gd_sales_estimate_agpv_usd_amt) AS signed_agpv
+    FROM ba_commerce.final_campaign_table
+    WHERE gd_merchant_id IS NOT NULL GROUP BY 1
+),
+merchant_agpv AS (
+    SELECT m.business_uuid, m.kyc_date, m.kyc_month,
+        CASE
+            WHEN c.signed_agpv < 50000                                THEN '1. Under $50K'
+            WHEN c.signed_agpv >= 50000  AND c.signed_agpv < 100000  THEN '2. $50K–$100K'
+            WHEN c.signed_agpv >= 100000 AND c.signed_agpv < 250000  THEN '3. $100K–$250K'
+            WHEN c.signed_agpv >= 250000 AND c.signed_agpv < 500000  THEN '4. $250K–$500K'
+            WHEN c.signed_agpv >= 500000 AND c.signed_agpv < 1000000 THEN '5. $500K–$1M'
+            WHEN c.signed_agpv >= 1000000                            THEN '6. Over $1M'
+            ELSE 'Unknown'
+        END AS signed_agpv_band
     FROM merchant_kyc m
-    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
-    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
-    GROUP BY 1, 2, m.kyc_month
+    LEFT JOIN campaigns c ON m.business_uuid = c.gd_merchant_id
 ),
-all_last AS (
-    SELECT m.business_uuid, m.current_acquisition_channel,
-        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
-    FROM merchant_kyc m
+txn AS (
+    SELECT m.business_uuid, m.kyc_month, m.signed_agpv_band,
+        DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', t.create_utc_ts)) AS months_since_kyc
+    FROM merchant_agpv m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
-    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
-    GROUP BY 1, 2, m.kyc_month
+    WHERE t.catalog_item_flag = 1
+      AND t.create_utc_ts >= m.kyc_date
+      AND t.create_utc_ts >= '2025-07-01'
+    GROUP BY 1, 2, 3, 4
 ),
-catalog_cohort AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM catalog_last GROUP BY 1),
-all_cohort    AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM all_last    GROUP BY 1),
-catalog_dist  AS (SELECT current_acquisition_channel, last_active_month, COUNT(DISTINCT business_uuid) AS cnt FROM catalog_last WHERE last_active_month >= 0 GROUP BY 1, 2),
-all_dist      AS (SELECT current_acquisition_channel, last_active_month, COUNT(DISTINCT business_uuid) AS cnt FROM all_last    WHERE last_active_month >= 0 GROUP BY 1, 2)
-SELECT 'Catalog Txn' AS txn_type, d.current_acquisition_channel, d.last_active_month,
-    ROUND(100.0 * d.cnt / NULLIF(c.total, 0), 2) AS pct_of_cohort
-FROM catalog_dist d JOIN catalog_cohort c ON d.current_acquisition_channel = c.current_acquisition_channel
-UNION ALL
-SELECT 'All Txn' AS txn_type, d.current_acquisition_channel, d.last_active_month,
-    ROUND(100.0 * d.cnt / NULLIF(c.total, 0), 2) AS pct_of_cohort
-FROM all_dist d JOIN all_cohort c ON d.current_acquisition_channel = c.current_acquisition_channel
-ORDER BY 1, 2, 3;</pre>
+cohort AS (
+    SELECT kyc_month, signed_agpv_band, COUNT(DISTINCT business_uuid) AS total
+    FROM txn GROUP BY 1, 2
+),
+ret AS (
+    SELECT kyc_month, signed_agpv_band, months_since_kyc, COUNT(DISTINCT business_uuid) AS active
+    FROM txn WHERE months_since_kyc >= 0 GROUP BY 1, 2, 3
+)
+SELECT
+    TO_CHAR(r.kyc_month, 'YYYY-MM') AS kyc_month,
+    r.signed_agpv_band,
+    r.months_since_kyc,
+    c.total AS cohort_size,
+    ROUND(100.0 * r.active / NULLIF(c.total, 0), 2) AS retention_pct
+FROM ret r
+JOIN cohort c ON r.kyc_month = c.kyc_month AND r.signed_agpv_band = c.signed_agpv_band
+ORDER BY 2, 1, 3;</pre>
 </div>
 
 </main>
