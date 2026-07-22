@@ -39,6 +39,8 @@
   <a href="#agpv-usage">aGPV Usage</a>
   <a href="#dropoff">Drop-Off</a>
   <a href="#retention">Retention</a>
+  <a href="#gap-profile">Why Skip Catalog</a>
+  <a href="#incremental-gpv">Incremental GPV</a>
 </nav>
 <main>
 
@@ -671,6 +673,150 @@ JOIN cohort c ON r.kyc_month = c.kyc_month AND r.signed_agpv_band = c.signed_agp
 ORDER BY 2, 1, 3;</pre>
 </div>
 
+
+<div class="query-block" id="gap-profile">
+  <h2>Why Merchants Skip Catalog &mdash; Gap Group Profile</h2>
+  <div class="meta">
+    <span>&#128202; Section 17</span>
+    <span>Tables: dna_approved.payment_360, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
+  </div>
+  <div class="note">Segments 30-day catalog adopters into 3 groups by their 90-day transaction behavior, then profiles the "Gap: Txn, No Catalog" group (transacts, but never via catalog) against the "Catalog Txn" group on hardware ownership, payment tools, first-transaction channel, and MCC.</div>
+  <pre>-- Prepend shared temp tables first (catalog_sku_job_cln + store_business_map)
+
+WITH merchant_kyc AS (
+    SELECT business_uuid, current_acquisition_channel,
+        full_application_approval_utc_ts AS kyc_ts,
+        full_application_approval_utc_ts::date AS kyc_date
+    FROM dna_approved.payment_360
+    WHERE full_application_approval_utc_ts IS NOT NULL AND type_desc_text != 'TEST_MERCHANT'
+      AND full_application_approval_utc_ts >= '2025-01-01' AND full_application_approval_utc_ts < '2026-04-01'
+      AND current_acquisition_channel IN ('Sales Initiated','Self Serve')
+),
+adopters_30d AS (
+    SELECT DISTINCT m.business_uuid, m.current_acquisition_channel, m.kyc_ts, m.kyc_date
+    FROM merchant_kyc m
+    JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+    JOIN catalog_sku_job_cln c ON sbm.store_uuid = c.store_id
+        AND c.created_at_utc_ts >= m.kyc_ts AND c.created_at_utc_ts &lt;= DATEADD(day,30,m.kyc_date)
+),
+catalog_txn_90d AS (
+    SELECT DISTINCT a.business_uuid
+    FROM adopters_30d a
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = a.business_uuid AND t.catalog_item_flag = 1
+        AND t.create_utc_ts >= a.kyc_ts AND t.create_utc_ts &lt;= DATEADD(day,90,a.kyc_date)
+),
+any_txn_90d AS (
+    SELECT DISTINCT a.business_uuid
+    FROM adopters_30d a
+    JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = a.business_uuid
+        AND t.create_utc_ts >= a.kyc_ts AND t.create_utc_ts &lt;= DATEADD(day,90,a.kyc_date)
+),
+segmented AS (
+    SELECT a.business_uuid, a.current_acquisition_channel,
+        CASE WHEN ct.business_uuid IS NOT NULL THEN 'Catalog Txn'
+             WHEN at.business_uuid IS NOT NULL THEN 'Gap: Txn, No Catalog'
+             ELSE 'No Txn At All' END AS segment
+    FROM adopters_30d a
+    LEFT JOIN catalog_txn_90d ct ON a.business_uuid = ct.business_uuid
+    LEFT JOIN any_txn_90d at ON a.business_uuid = at.business_uuid
+)
+-- Boolean/behavioral flag comparison (SUM/COUNT, not AVG(CASE...) -- see note below)
+SELECT
+    s.current_acquisition_channel, s.segment, COUNT(*) AS merchants,
+    ROUND(100.0*SUM(CASE WHEN p.smart_terminal_flag THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_smart_terminal,
+    ROUND(100.0*SUM(CASE WHEN p.card_reader_flag THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_card_reader,
+    ROUND(100.0*SUM(CASE WHEN p.paylink_transaction_flag THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_paylink_txn,
+    ROUND(100.0*SUM(CASE WHEN p.invoicing_transaction_flag THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_invoicing_txn,
+    ROUND(100.0*SUM(CASE WHEN p.saas_plan_active_flag THEN 1 ELSE 0 END)/COUNT(*),1) AS pct_saas_active
+FROM segmented s
+JOIN dna_approved.payment_360 p ON s.business_uuid = p.business_uuid
+GROUP BY 1,2
+
+-- First-transaction-channel and MCC breakdown for the "Gap" segment only:
+-- same CTEs, then SELECT current_acquisition_channel, first_transaction_channel (or merchant_category_description),
+-- COUNT(*), and a window-function percentage, filtered to segment = 'Gap: Txn, No Catalog'.</pre>
+  <div class="note"><b>Gotcha:</b> in Redshift, <code>AVG(CASE WHEN bool_col THEN 1 ELSE 0 END)</code> silently returned 0 across every group in this multi-CTE query, even though the underlying flags had real non-null variation. Rewriting as <code>SUM(CASE...)/COUNT(*)</code> fixed it &mdash; confirmed by cross-checking against a raw <code>SUM</code> on a known subset. Prefer <code>SUM/COUNT</code> over <code>AVG(CASE...)</code> for boolean percentages in this environment.</div>
+</div>
+
+<div class="query-block" id="incremental-gpv">
+  <h2>Incremental GPV From Catalog Usage</h2>
+  <div class="meta">
+    <span>&#128202; Section 18</span>
+    <span>Tables: dna_approved.payment_360, ba_commerce.final_campaign_table, catalog_sku_job_cln (temp), store_business_map (temp), dev.ba_commerce.txn_w_catalog</span>
+    <span>Method: OLS regression in Python (statsmodels), not pure SQL</span>
+  </div>
+  <div class="note">Three-way segmentation (No Product / Product, No Catalog Txn / Product + Catalog Txn) with 90-day post-KYC GPV as the outcome. SQL pulls one row per merchant with group, covariates, and GPV; the regression (with the group &times; hardware_flag interaction) runs in Python.</div>
+  <pre>-- Merchant-level extract (SI shown; SS is the same query with current_acquisition_channel = 'Self Serve',
+-- no aGPV band/campaigns join, and GPV capped at SS's own 99th percentile instead of SI's)
+
+WITH merchant_kyc AS (
+  SELECT business_uuid, full_application_approval_utc_ts AS kyc_ts, full_application_approval_utc_ts::date AS kyc_date,
+      TRIM(merchant_category_description) AS mcc, business_type, gdp_enablement_type,
+      COALESCE(wm_subscription_flag,false) OR COALESCE(ecommerce_subscription_flag,false) AS has_online_store,
+      COALESCE(smart_terminal_flag,false) OR COALESCE(smart_terminal_flex_flag,false)
+        OR COALESCE(smart_terminal_pro_flag,false) OR COALESCE(card_reader_flag,false) AS hardware_flag
+  FROM dna_approved.payment_360
+  WHERE full_application_approval_utc_ts IS NOT NULL AND type_desc_text != 'TEST_MERCHANT'
+    AND full_application_approval_utc_ts >= '2025-01-01' AND full_application_approval_utc_ts &lt; '2026-04-01'
+    AND current_acquisition_channel = 'Sales Initiated'
+),
+adopters_30d AS (
+  SELECT DISTINCT m.business_uuid, m.kyc_ts, m.kyc_date
+  FROM merchant_kyc m
+  JOIN store_business_map sbm ON m.business_uuid = sbm.business_uuid
+  JOIN catalog_sku_job_cln c ON sbm.store_uuid = c.store_id
+    AND c.created_at_utc_ts >= m.kyc_ts AND c.created_at_utc_ts &lt;= DATEADD(day,30,m.kyc_date)
+),
+catalog_txn_90d AS (
+  SELECT DISTINCT a.business_uuid FROM adopters_30d a
+  JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid=a.business_uuid AND t.catalog_item_flag=1
+    AND t.create_utc_ts>=a.kyc_ts AND t.create_utc_ts&lt;=DATEADD(day,90,a.kyc_date)
+),
+gpv_90d AS (
+  SELECT m.business_uuid, COALESCE(SUM(t.order_total_amt_usd),0) AS gpv
+  FROM merchant_kyc m
+  LEFT JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid=m.business_uuid
+    AND t.create_utc_ts>=m.kyc_ts AND t.create_utc_ts&lt;=DATEADD(day,90,m.kyc_date)
+  GROUP BY 1
+),
+campaigns AS (
+  SELECT gd_merchant_id, MAX(gd_sales_estimate_agpv_usd_amt) AS signed_agpv
+  FROM ba_commerce.final_campaign_table WHERE gd_merchant_id IS NOT NULL GROUP BY 1
+),
+mcc_rank AS (
+    SELECT mcc, COUNT(*) cnt, ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) rn
+    FROM merchant_kyc GROUP BY 1
+)
+SELECT m.business_uuid,
+    CASE WHEN ct.business_uuid IS NOT NULL THEN '3. Product + Catalog Txn'
+         WHEN a.business_uuid IS NOT NULL THEN '2. Product, No Catalog Txn'
+         ELSE '1. No Product' END AS grp,
+    CASE
+        WHEN c.signed_agpv IS NULL THEN 'Unknown'
+        WHEN c.signed_agpv &lt; 50000 THEN '1. Under $50K'
+        WHEN c.signed_agpv &lt; 100000 THEN '2. $50K-$100K'
+        WHEN c.signed_agpv &lt; 250000 THEN '3. $100K-$250K'
+        WHEN c.signed_agpv &lt; 500000 THEN '4. $250K-$500K'
+        WHEN c.signed_agpv &lt; 1000000 THEN '5. $500K-$1M'
+        ELSE '6. Over $1M' END AS agpv_band,
+    CASE WHEN mr.rn &lt;= 8 THEN m.mcc ELSE 'Other' END AS mcc_bucket,
+    m.business_type, m.gdp_enablement_type, m.has_online_store, m.hardware_flag,
+    g.gpv, LEAST(g.gpv, 271163) AS gpv_capped   -- 271163 = SI's 99th percentile 90d GPV
+FROM merchant_kyc m
+LEFT JOIN adopters_30d a ON m.business_uuid=a.business_uuid
+LEFT JOIN catalog_txn_90d ct ON m.business_uuid=ct.business_uuid
+LEFT JOIN campaigns c ON m.business_uuid=c.gd_merchant_id
+LEFT JOIN mcc_rank mr ON m.mcc = mr.mcc
+JOIN gpv_90d g ON m.business_uuid=g.business_uuid
+
+# --- Python regression on the extracted data ---
+# formula = 'gpv_capped ~ C(grp)*C(hardware_flag) + C(agpv_band) + C(mcc_bucket)
+#            + C(business_type) + C(gdp_enablement_type) + C(has_online_store)'
+# model = statsmodels.formula.api.ols(formula, data=df).fit()
+# Within-hardware-group effects read via t_test() contrasts, e.g.:
+#   "C(grp)[T.3. Product + Catalog Txn] + C(grp)[T.3. Product + Catalog Txn]:C(hardware_flag)[T.True] = 0"</pre>
+  <div class="note"><b>Why a Python regression instead of SQL group-bys:</b> comparing raw GPV averages between catalog users and non-users would be confounded by merchant size (catalog adopters skew toward bigger aGPV bands/more established businesses). The OLS regression holds signed aGPV band, MCC category, business type, GDP enablement path, online-store subscription, and hardware ownership fixed, so the group coefficient reflects catalog's association with GPV net of those confounders &mdash; then a group &times; hardware_flag interaction lets the catalog effect differ by whether a merchant already owns payment hardware, which is where most of the actual variation turned out to live. 90-day GPV is capped at each channel's own 99th percentile before modeling to limit outlier influence; a bootstrap (1,000 resamples) on the SI no-hardware slice confirmed the normal-theory p-value wasn't an artifact of the heavily skewed residuals.</div>
+</div>
 </main>
 <footer>GoDaddy Commerce Analytics &bull; KYC Catalog Lifecycle &bull;
   <a href="https://github.com/mchen1-godaddy/catalog-lifecycle">GitHub</a> &bull;
