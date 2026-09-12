@@ -27,7 +27,7 @@
 <body>
 <header>
   <h1>KYC Catalog Lifecycle — SQL Reference</h1>
-  <p>All queries powering the dashboard &bull; Redshift / dna_approved / dev.ba_commerce &bull; Data range: Jan 2025 – Jun 2026</p>
+  <p>All queries powering the dashboard &bull; Redshift / dna_approved / dev.ba_commerce &bull; Data range: Jan 2024 &ndash; Jun 2026</p>
 </header>
 <nav>
   <a href="index.html">← Dashboard</a>
@@ -58,12 +58,12 @@ FROM dev.signals_platform_cln.catalog_sku_job_cln a
 INNER JOIN (
     SELECT sku_id, store_id, MAX(event_utc_ts) AS max_ts
     FROM dev.signals_platform_cln.catalog_sku_job_cln
-    WHERE created_at_utc_ts >= '2025-01-01'
+    WHERE created_at_utc_ts >= '2024-01-01'
     GROUP BY 1, 2
 ) b ON a.sku_id = b.sku_id
     AND a.store_id = b.store_id
     AND a.event_utc_ts = b.max_ts
-WHERE a.created_at_utc_ts >= '2025-01-01';
+WHERE a.created_at_utc_ts >= '2024-01-01';
 
 -- Store UUID → Business UUID mapping (latest snapshot, US only)
 DROP TABLE IF EXISTS store_business_map;
@@ -94,7 +94,7 @@ WHERE b.snap_date = (SELECT MAX(snap_date) FROM poynt_cln.business_cln WHERE reg
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
@@ -159,7 +159,7 @@ ORDER BY 1, 2;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
@@ -234,7 +234,7 @@ ORDER BY 1, 2;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel = 'Sales Initiated'   -- change to 'Self Serve' for Chart 5
 ),
@@ -290,7 +290,7 @@ ORDER BY 1, 2;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel = 'Sales Initiated'   -- change to 'Self Serve' for SS
 ),
@@ -355,7 +355,7 @@ ORDER BY 1, 2;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'   -- use '2026-04-01' for 90-day chart
       AND current_acquisition_channel = 'Sales Initiated'
 ),
@@ -385,7 +385,7 @@ catalog_txn AS (
         MIN(t.create_utc_ts::date) AS first_catalog_txn_date
     FROM dev.ba_commerce.txn_w_catalog t
     WHERE t.catalog_item_flag = 1
-      AND t.create_utc_ts >= '2025-01-01'
+      AND t.create_utc_ts >= '2024-01-01'
     GROUP BY 1
 )
 SELECT
@@ -417,7 +417,7 @@ ORDER BY 1, 2;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
@@ -431,7 +431,7 @@ last_active AS (
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
     WHERE t.catalog_item_flag = 1
       AND t.create_utc_ts >= m.kyc_date
-      AND t.create_utc_ts >= '2025-01-01'
+      AND t.create_utc_ts >= '2024-01-01'
     GROUP BY 1, 2, m.kyc_month
 ),
 cohort AS (
@@ -468,7 +468,7 @@ ORDER BY 1, 2;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
@@ -477,7 +477,7 @@ catalog_last AS (
         DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
     FROM merchant_kyc m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
-    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2024-01-01'
     GROUP BY 1, 2, m.kyc_month
 ),
 all_last AS (
@@ -485,7 +485,7 @@ all_last AS (
         DATEDIFF('month', m.kyc_month, DATE_TRUNC('month', MAX(t.create_utc_ts))) AS last_active_month
     FROM merchant_kyc m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
-    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2024-01-01'
     GROUP BY 1, 2, m.kyc_month
 ),
 catalog_cohort AS (SELECT current_acquisition_channel, COUNT(DISTINCT business_uuid) AS total FROM catalog_last GROUP BY 1),
@@ -518,7 +518,7 @@ ORDER BY 1, 2, 3;</pre>
     FROM dna_approved.payment_360
     WHERE full_application_approval_utc_ts IS NOT NULL
       AND type_desc_text != 'TEST_MERCHANT'
-      AND full_application_approval_utc_ts >= '2025-01-01'
+      AND full_application_approval_utc_ts >= '2024-01-01'
       AND full_application_approval_utc_ts < '2026-07-01'
       AND current_acquisition_channel IN ('Sales Initiated', 'Self Serve')
 ),
@@ -529,7 +529,7 @@ cat_txn AS (
         'Catalog Txn' AS txn_type
     FROM merchant_kyc m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
-    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    WHERE t.catalog_item_flag = 1 AND t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2024-01-01'
     GROUP BY 1, 2, 3, 4
 ),
 -- All-transaction retention
@@ -539,7 +539,7 @@ all_txn AS (
         'All Txn' AS txn_type
     FROM merchant_kyc m
     JOIN dev.ba_commerce.txn_w_catalog t ON t.business_uuid = m.business_uuid
-    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2025-01-01'
+    WHERE t.create_utc_ts >= m.kyc_date AND t.create_utc_ts >= '2024-01-01'
     GROUP BY 1, 2, 3, 4
 ),
 combined AS (SELECT * FROM cat_txn UNION ALL SELECT * FROM all_txn),
@@ -692,7 +692,7 @@ WITH merchant_kyc AS (
         OR COALESCE(smart_terminal_pro_flag,false) OR COALESCE(card_reader_flag,false) AS hardware_flag
   FROM dna_approved.payment_360
   WHERE full_application_approval_utc_ts IS NOT NULL AND type_desc_text != 'TEST_MERCHANT'
-    AND full_application_approval_utc_ts >= '2025-01-01' AND full_application_approval_utc_ts &lt; '2026-04-01'
+    AND full_application_approval_utc_ts >= '2024-01-01' AND full_application_approval_utc_ts &lt; '2026-04-01'
     AND current_acquisition_channel = 'Sales Initiated'
 ),
 adopters_30d AS (
